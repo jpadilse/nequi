@@ -1,0 +1,474 @@
+---
+title: "Científico de Datos en NEQUI"
+subtitle: "Prueba Técnica"
+author: "Juan Felipe Padilla Sepulveda (C.C. 1.112.494.378)"
+format: 
+    html:
+        embed-resources: true
+lang: es
+fig-width: 6
+fig-align: "center"
+dpi: 400
+execute:
+    eval: false
+    echo: false
+    message: false
+    warning: false
+knitr:
+    opts_chunk:
+        comment: "#>"
+        collapse: true 
+        fig-asp: 0.618
+        fig-show: "hold"
+        out-width: "70%"
+        tidy: "styler"
+---
+
+# Introducción
+
+Se parte de la primera base de datos proporcionada ya que ambas contienen una distribución similar de la información. Esta base de datos tiene 11 meses, desde el 2021-01-01 hasta el 2021-11-30 (se eliminan los valores del 2020-12 ya que no son representativos).
+
+## Framework
+
+El lenguaje de programación escogido es R por sus capacidades para la transformación y exploración de los datos, librerías estadísticas y de aprendizaje automático para datos tabulares. Por otro lado, para la arquitectura se propone Microsoft Azure debido a su fácil integración con R y ser un estándar en la industria.
+
+## Definición de Fraude
+
+Para localizar las transacciones que representan una mala practica transaccional se calculan las siguientes variables sobre todas las transacciones en las 24 horas anteriores a la transacción examinada:
+
+-   Monto promedio por transacción sobre cada cuenta
+-   Número de transacciones sobre cada cuenta
+-   Monto promedio por transacción sobre cada usuario
+-   Número de transacciones sobre cada usuario
+
+Estas variables buscar capturar de manera conjunta la ventana de tiempo y estrategias que caracterizan el fraccionamiento transaccional. Luego de calcularlas se eliminan aquellos valores para los que no se tenga al menos un día de historia.
+
+Para hallar este tipo de fraude se usa la detección multivariada de datos atípicos a través de la distancia de Mahalanobis, con estadísticos robustos para la media y la covarianza (*Minimum Covariance Determinant Estimator*). Sin embargo, estos valores extremos incluyen aquellas combinaciones de alto monto en pocas transacciones obligando a dejar únicamente aquellas observaciones que tengan más de cinco transacciones en las últimas 24 horas ya que es valor a partir del cual hay un salto en los percentiles.
+
+El objetivo es calificar como fraude la primera transacción de este gran número de pequeñas transacciones. Por ende, se busca la primera transacción en la ventana de tiempo para cada una de las observaciones atípicas encontradas. Finalmente, se eliminan las transacciones que en realidad hacen parte de una gran serie de pequeñas transacciones que se extiende por días. Por ejemplo, si en una misma cuenta hay dos días consecutivos con un alto número de movimientos solo se deja el primero en total y no uno por día.
+
+La construcción de esta variable sigue las buenas practicas de la industria pero es importante recalcar que debido a la ausencia de una confirmación de estos valores extremos como fraudes existe un ruido inherente.
+
+# Atributos
+
+Los atributos primarios de las transacciones son aquellos disponibles por defecto en la anterior base de datos. Especifícame, son:
+
+-   ID
+-   ACCOUNT_NUMBER
+-   USER_ID
+-   MERCHANT_ID
+-   SUBSIDIARY
+-   TRANSACTION_DATE
+-   TRANSACTION_TYPE
+-   TRANSACTION_AMOUNT
+
+De acuerdo a las buenas practicas sobre la detección de fraude se emplea una estrategia de agregación de transacciones, con el fin de capturar el comportamiento de consumo en el pasado reciente. Específicamente, se crean atributos derivados de los primarios que representan la actualidad, frecuencia y valor monetario:
+
+-   **AVG_AMOUNT_P\_TRANSACTION_1D_ACCOUNT**: monto promedio por transacción sobre cada cuenta en el último día
+-   **AVG_AMOUNT_P\_TRANSACTION_3D_ACCOUNT**: monto promedio por transacción sobre cada cuenta en los últimos tres días
+-   **AVG_AMOUNT_P\_TRANSACTION_7D_ACCOUNT**: monto promedio por transacción sobre cada cuenta en los últimos siete días
+-   **AVG_AMOUNT_P\_TRANSACTION_15D_ACCOUNT**: monto promedio por transacción sobre cada cuenta en los últimos 15 días
+-   **AVG_AMOUNT_P\_TRANSACTION_30D_ACCOUNT**: monto promedio por transacción sobre cada cuenta en los últimos 30 días
+-   **N_TRANSACTIONS_1D_ACCOUNT**: número de transacciones sobre cada cuenta en el último día
+-   **N_TRANSACTIONS_3D_ACCOUNT**: número de transacciones sobre cada cuenta en los últimos tres días
+-   **N_TRANSACTIONS_7D_ACCOUNT**: número de transacciones sobre cada cuenta en los últimos siete días
+-   **N_TRANSACTIONS_15D_ACCOUNT**: número de transacciones sobre cada cuenta en los últimos 15 días
+-   **N_TRANSACTIONS_30D_ACCOUNT**: número de transacciones sobre cada cuenta en los últimos 30 días
+
+Es importante resaltar que se incluyen rangos de tiempo de corto (1D y 3D), mediano (7D y 15D) y largo plazo (30D) con el fin de validar la ventana de tiempo que tiene mayor impacto en las predicciones.
+
+Se decide no realizar agregaciones por usuario ya que su comportamiento no se diferencia prácticamente de las cuentas. Por otro lado, se eliminan aquellas observaciones que no tuvieran al menos un mes de historia y cinco operaciones (evidenciando que la cuenta esta activa). Por último, con el fin de mantener la sabana de datos manejable para un equipo local pero conservando la distribución normalmente vista en la industria se crea una muestra aleatoria con un porcentaje de fraude menor al 5 %.
+
+## Análisis Exploratorio
+
+### Variable Objetivo
+
+![](./1.png)
+
+```{r}
+raw_data |> 
+  count(Y_VAR) |> 
+  mutate(pct = n / sum(n)) |> 
+  ggplot(aes(Y_VAR, pct)) +
+    geom_col(aes(fill = Y_VAR)) +
+    geom_label(
+      aes(label = str_glue('{c_percent(pct)} - {c_comma(n)}')),
+      alpha = 0.8
+    ) +
+    scale_y_continuous(labels = c_percent) +
+    labs(x = "", y = "% de registros") +
+    guides(fill = "none")
+```
+
+### Variables Predictoras
+
+En esta sección se caracterizan gráficamente los usuarios de la muestra usada para el modelado del fraude:
+
+#### Númericas
+
+![](./2.png)
+
+```{r}
+#| fig-asp: 1
+raw_data |> 
+  select(where(is.numeric), Y_VAR) |> 
+  pivot_longer(-Y_VAR, names_to = "var", values_to = "val") |> 
+  mutate(
+    var = str_replace_all(var, "_", " "),
+    var = str_remove_all(var, "P_TRANSACTION"),
+    var = str_remove_all(var, "ACCOUNT")
+  ) |> 
+  ggplot(aes(val)) + 
+    geom_histogram(
+      aes(fill = Y_VAR), 
+      bins = 50, 
+      alpha = 0.5,
+      position = "identity"
+    ) + 
+    scale_x_continuous(labels = c_comma) +
+    scale_y_continuous(labels = c_comma, n.breaks = 2) +
+    scale_fill_manual(values = c("No" = "forestgreen", "Si" = "red")) +
+    labs(
+      x = "Rangos de cada variable", 
+      y = "Número de usuarios",
+      fill = "¿Es la primera transacción de un fraude?"
+    ) +
+    facet_wrap(vars(var), scales = "free", ncol = 3) +
+    theme(
+      legend.position = "top",
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 8)
+    )
+```
+
+#### Categóricas
+
+![](./3.png)
+
+```{r}
+#| fig-asp: 1
+raw_data |> 
+  select(where(is.factor)) |>
+  mutate(across(where(is.factor), ~ fct_na_value_to_level(., "(Otro)"))) |> 
+  pivot_longer(-Y_VAR, names_to = "var", values_to = "val") |> 
+  mutate(var = str_replace_all(var, "_", " ")) |> 
+  count(var, val, Y_VAR) |> 
+  mutate(pct = n / sum(n), .by = c("var", "Y_VAR")) |> 
+  ggplot(aes(val, pct)) + 
+    geom_col(
+      aes(fill = Y_VAR), 
+      alpha = 0.5, 
+      position = "dodge"
+    ) +
+    scale_y_continuous(labels = c_percent, n.breaks = 4) +
+    scale_fill_manual(values = c("No" = "forestgreen", "Si" = "red")) +
+    labs(
+      x = "Niveles de cada variable",
+      y = "% de usuarios",
+      fill = "¿Es la primera transacción de un fraude?"
+    ) +
+    theme(
+      legend.position = "top",
+      axis.text.x = element_text(size = 8),
+      axis.text.y = element_text(size = 8)
+    ) +
+    facet_wrap(vars(var), scales = "free", ncol = 1)
+```
+
+## Preprocesamiento
+
+### Variables Categóricas
+
+Buscando no eliminar ninguna observación por ausencia de información en las variables categóricas se asigna a toda categoría vacía el nivel "(Desconocido)". Por otro lado, se agrupan todas las categorías de cada variable nominal con un porcentaje menor al 5 % en el nivel "(Otro)". Finalmente, es importante mencionar que los algoritmos para modelos basados en árboles pueden manejar naturalmente los predictores categóricos.
+
+### Todas las variables
+
+Con el fin de eliminar variables redundantes se realizan los siguientes pasos:
+
+1.  Se eliminan aquellas variables con varianza igual a cero, es decir, que son constantes para toda la base.
+
+2.  Se eliminan aquellas variables con varianza cercana a cero, cuyas características son:
+
+    -   Tienen muy pocos valores únicos en relación al número de muestras. Concretamente, el número de valores únicos dividido por el número total de muestras (multiplicado por $100$) debe estar por debajo de $10$.
+    -   La relación entre la frecuencia del valor más común y la frecuencia del segundo valor más común es grande. Específicamente, la proporción debe ser mayor a $95 / 5$.
+
+3.  Se eliminan aquellas variables altamente correlacionadas que puedan presentar multicolinealidad. En particular, se eliminan variables para mantener la mayor correlación absoluta entre las variables por debajo del 90 %.
+
+![](./4.png)
+
+```{r}
+#| fig-asp: 1
+corrplot(
+  raw_data |>
+    select(where(is.numeric)) |>
+     filter(
+       if_all(where(is.numeric), ~ is.finite(.x) & !is.na(.x))
+     ) |> 
+    cor() |>
+    abs(),
+  method = "color",
+  col = viridis(20, option = "D"),
+  diag = FALSE,
+  order = "FPC",
+  tl.cex = 0.5,
+  tl.col = "black",
+  tl.offset = 1,
+  tl.srt = 45,
+  cl.cex = 0.8,
+  cl.offset = 0.9,
+  cl.lim = c(0, 1),
+  cl.ratio = 0.2,
+  title = "Correolograma entre variables númericas"
+)
+```
+
+## Desbalance
+
+Como es típico de los modelos sobre fraude hay un gran desbalanceo en la base de datos que debe ser compensado para una correcta estimación del modelo. Un método eficiente y escalable es el submuestreo aleatorio de las transacciones no fraudulentas hasta alcanzar una proporción aproximada de 20/80.
+
+### División
+
+Con el fin de realizar una validación del modelo construido se distribuye la base de datos en dos conjuntos de información: uno de entrenamiento (80 %) y uno de prueba (20 %). Asimismo, para asegurar una correcta distribución de la variable dependiente en ambos grupos se usa un muestreo estratificado para asignar el conjunto de datos de entrenamiento y prueba con respecto a la variable a predecir. Dicho de otro modo, conservar la proporción original entre los niveles de la variable a predecir en ambos subconjuntos de datos.
+
+## Modelo Elegido
+
+El modelo a usar es *LighGBM* debido a su gran capacidad de predicción en datos tabulares y poca necesidad de preprocesamiento. Por otro parte, el modelo es categórico debido a que la variable que se requiere predecir solo tiene dos valores ("Es la primera transacción de un fraccionamiento transaccional" y "Es una operación cotidiana").
+
+### Optimización de Hiperparámetros
+
+#### Validación Cruzada
+
+Con el fin de optimizar los hiperparámetros del modelo se divide aleatoriamente el conjunto de entrenamiento (el 80 % separado al inicio) en diez grupos de aproximadamente igual tamaño. Cada remuestreo consiste de nueve de los diez grupos que luego es validado en el grupo restante. Dicho de otro modo, hay diez remuestreos donde cada uno es una combinación de nueve de los diez subconjuntos de datos.
+
+Es importante mencionar que se uso un muestreo estratificado al distribuir los diez grupos de acuerdo a la variable a predecir. Finalmente, la validación cruzada busca garantizar que los resultados obtenidos sean independientes a la partición de entrenamiento y prueba.
+
+#### Grilla de Hiperparámetros
+
+Los principales parámetros considerados para un modelo de bosque aleatorio son los siguientes:
+
+-   *Número de estimadores*: indica la cantidad de arboles presentes en el ensamble. 
+
+-   *Tamaño mínimo del nodo*: cada árbol crece hasta que todas sus hojas cumplen una cantidad mínima de muestras.
+
+-   *Profundidad*: es la profundidad máxima que puede alcanzar el árbol.
+
+- *Tasa de aprendizaje*: valor de adaptación entre iteraciones.
+
+Se usan 100 combinaciones entre los niveles de cada parámetro con el fin de cubrir todo su rango.
+
+#### Búsqueda de Grilla
+
+Basados en la grilla de parámetros y los diez remuestreos de la base de datos de entrenamiento, se estima para cada combinación y muestreo. El siguiente gráfico muestra el área bajo la curva de ROC para cada caso:
+
+![](./5.png)
+
+```{r}
+main_tuning_bayes |>
+  autoplot() +
+    labs(x = NULL, y = "Área bajo la curva de ROC")
+```
+
+Es importante conocer la curva de ROC para el mejor modelo encontrado (agregado para todos los remuestreos) con el fin de tener una aproximación de la calidad del modelo predictivo:
+
+![](./6.png)
+
+```{r}
+#| fig-asp: 1
+autoplot(main_pred_val) +
+    scale_y_continuous(labels = c_comma) +
+    scale_x_continuous(labels = c_comma) +
+    labs(
+      x = "1 - Especificidad",
+      y = "Sensibilidad"
+    )
+```
+
+El anterior resultado evidencia una gran capacidad del modelo para distinguir las categorías de la variable a predecir.
+
+### Modelo Elegido
+
+Teniendo claro los parámetros ideales para el modelo se estima un modelo con toda la base entrenamiento y la calibración adecuada. Luego, se realiza la validación con el 20 % de la base total reservada hasta el momento:
+
+![](./7.png)
+
+```{r}
+full_metrics <- metric_set(
+  accuracy, 
+  bal_accuracy,
+  # detection_prevalence,
+  # f_meas,
+  # j_index,
+  # kap,
+  # mcc,
+  # npv,
+  # ppv,
+  # precision,
+  # recall,
+  sens,
+  spec,
+  roc_auc
+)
+
+all_metrics <- test_pred |> 
+  full_metrics(
+    truth = .data[[y]], 
+    estimate = .pred_with_eqz,
+    .data[[str_glue(".pred_{y_event}")]]
+  )
+
+all_metrics |> 
+  transmute(
+    `Métrica` = c(
+      "Precisión", 
+      "Precisión Promedio",
+      "Sensibilidad",
+      "Especificidad",
+      "Area Bajo la Curva de ROC"
+    ),
+    Valor = c_comma(.estimate, 0.01)
+  ) |> 
+  kable(align = c("c", "c")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "responsive")) |>
+  column_spec(1, width_min = "1in", bold = TRUE) |>
+  column_spec(2, width_min = "1in") |>
+  row_spec(0, color = "white", background = "SeaGreen")
+```
+
+Los valores mostrados en la anterior tabla evidencian un buen ajuste del modelo y respaldan su capacidad para distinguir las diferentes categorías.
+
+Por otro parte, se muestra la curva de ROC para el modelo:
+
+![](./8.png)
+
+```{r}
+test_pred |>
+  roc_curve(
+    .data[[str_glue(".pred_{y_event}")]],
+    truth = Y_VAR
+  ) |>
+  autoplot() +
+  scale_y_continuous(labels = c_comma) +
+  scale_x_continuous(labels = c_comma) +
+  labs(x = "1 - Especificidad", y = "Sensibilidad")
+```
+
+El alto resultado mostrado en el siguiente gráfico muestra que el clasificador está arrojando resultados precisos (alta **Precisión**), así como también arroja la mayoría de todos los resultados con fraude (alta **Exhaustividad**).
+
+![](./9.png)
+
+```{r}
+test_pred |>
+  pr_curve(
+    .data[[str_glue(".pred_{y_event}")]],
+    truth = Y_VAR
+  ) |>
+  autoplot() +
+  labs(x = "Exhaustividad", y = "Precisión")
+```
+
+La matriz de confusión correspondiente evidencia que la gran mayoría de las predicciones fueron correctas (la diagonal principal):
+
+![](./10.png)
+
+```{r}
+conf_mat(
+  test_pred,
+  truth = .data[[y]],
+  estimate = .pred_with_eqz
+) |>
+  cm_heat_custom() +
+  labs(x = "Observado", y = "Predicción")
+```
+
+## Importancia de variables
+
+A pesar de usar un modelo que se consideraría cerrado se puede calcular la importancia de las variables a través del efecto que tendrían si se volviera aleatoria en la estimación del modelo. Es decir, si la variable se vuelve aleatoria es significativa si impacta negativamente el resultado del modelo (*Shapley Additive Explanations*).
+
+Las variables con mayor importancia se resumen en el siguiente gráfico. Sin embargo, esto no significa que el resto de variables no aporten en la predicción de fraude.
+
+![](./11.png)
+
+```{r}
+ggplot_imp(vip_model)
+```
+
+![](./12.png)
+
+```{r}
+ggplot_pdp(pdp_main, N_TRANSACTIONS_30D_ACCOUNT)
+```
+
+```{r}
+# ggplot_local(shap_main, x_ids)
+```
+
+Se puede observar que los patrones de uso que preceden el fraude en el largo plazo son determinantes en la predicción. Dicho de otro modo, el contraste entre el comportamiento actual y pasado es el que permite la estimación correcta.
+
+# Punto de corte e incertidumbre
+
+El punto de corte permite observar que con el fin de maximizar las predicciones del modelo se debe marcar como fraude toda observación con una probabilidad menor:
+
+![](./14.png)
+
+```{r}
+ggplot(
+    threshold_data,
+    aes(x = .threshold, y = .estimate, colour = .metric)
+) +
+    geom_line() +
+    geom_vline(
+        xintercept = max_j_index_threshold,
+        alpha = 0.8,
+        color = "grey30"
+    ) +
+    scale_color_brewer(palette = "Set1") +
+    labs(
+        x = "Punto de corte para evento",
+        y = "Métrica Estimada",
+        colour = "Métrica",
+        title = "Calibrando resultados variando el punto de corte",
+        subtitle = "Línea vertical igual al máximo valor para el índice J"
+    ) 
+```
+
+<!-- Por último, la tasa de predicciones sin incertidumbre ($\pm 0.05$ alrededor del punto de corte) es del 0.99:  -->
+
+<!-- ```{r} -->
+<!-- test_pred |> -->
+<!--   summarise(reportable = reportable_rate(.pred_with_eqz)) |>  -->
+<!--   kable(align = c("c")) |> -->
+<!--   kable_styling(bootstrap_options = c("striped", "hover", "responsive")) |> -->
+<!--   column_spec(1, width_min = "1in") |> -->
+<!--   row_spec(0, color = "white", background = "SeaGreen") -->
+<!-- ``` -->
+
+# Despliegue
+
+## Arquitectura
+
+La arquitectura propuesta para el despliegue del modelo se basa en Microsoft Azure como se detalla en la siguiente figura:
+
+![](./arquitectura_produccion.png)
+
+1. Es necesario un *Resource Group* que contenga y aislé los recursos necesarios para este proyecto con el fin de llevar una correcta administración.
+2. Se parte de la existencia de un repositorio de datos en la nube (*SQL Database*) tipo *OLTP* que contiene el comportamiento transaccional histórico de los usuarios.
+3. Esta información se transforma con *Azure Data Factory* y se pone a disposición para su consumo analítico a través de *Azure Storage Account*.
+4. Se requiere la creación de un espacio de trabajo en *Azure Machine Learning* con el fin de entrenar y registrar el modelo.
+5. Se pone a disposición el modelo entrenado (en tiempo real) por medio un contenedor que posee un archivo con código para cargar el modelo y entregar una predicción y el ambiente de trabajo en el cual se ejecutara.
+6. El endpoint del modelo es consumido por *Stream Analytics* para aplicar el scoring de fraude de manera continua (en un tiempo menor a 10 segundos según los estándares) y guardar la información en la cuenta de almacenamiento.
+7. La conexión al núcleo financiero de la entidad se haría a través de *Event Hub* que registraría las transacciones y las pondría a disposición del flujo analítico.
+
+## Operación
+
+El funcionamiento operativo del modelo con los recursos planteados es:
+
+![](./operacion.png)
+
+1. Se realiza una transacción con un comercio.
+2. Esta transacción es comprobada por reglas de negocio que aseguran que la transacción es valida. De no ser así, se rechaza la transacción.
+3. Se evalúa el scoring de fraude en la transacción en tiempo real. Primero, si hay una alta probabilidad de fraude se anula la transacción y se guarda la información para el posterior reentranamiento del modelo con nuevos casos de fraude. Luego, si la probabilidad es considerable pero esta en el rango de corte del modelo (incertidumbre) se acepta la transacción pero se marca la necesidad de ser analizada a profundidad. Al final, si la probabilidad es baja se acepta la transacción sin ninguna marcación adicional.
+4. El usuario es notificado si su transacción es anulada de manera automática o si fue aceptada pero genera incertidumbre su comportamiento.
+
+## Monitoreo
+
+Los datos deben actualizarse con una alta frecuencia debido a la naturaleza cambiante del fraude. Específicamente, cada día que se agreguen casos de fraude confirmado a la base de datos debería ser reentrenado (normalmente a la media noche del día anterior) el modelo con el fin de incorporar los últimos patrones en futuras evaluaciones. Asimismo, es necesario realizar una supervisión de la estabilidad del comportamiento de los usuarios (si conservan la distribución evidenciada en el entrenamiento), la estabilidad de la precisión del modelo (posible degeneración de esta en el tiempo) y la calibración de las probabilidades exactas. Estas condiciones permiten controlar el ciclo de vida del modelo.
